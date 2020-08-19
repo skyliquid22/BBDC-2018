@@ -1,0 +1,948 @@
+---
+title: "BBDC - Final Code"
+author: "AE"
+date: "10/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Bremen Big Data Challenge
+
+The challenge given to contestants was to take wind farm data collected from January, 2016 to June 2017, and the predict the wind farm's output in July - December of 2017.
+
+The data includes:
+
+* Wind speed and direction at different elevations (All measurements were collected at various heights. All measurements were only taken at certain intervals, and as such certain observations have been linearly interpolated.)
+* A boolean variable which reflects whether the given observation was interpolated or not  
+* Capacity of the farm at a given time (This capacity variable is very nearly constant, and most likely only shows variation due to maitainence or downages at the farm.)  
+* Output of the farm (The original "challenge" data set presented to the contestants did not have any values in the output variable. Outside of the voiding of the output column, the challenge set and validation set are identical.)  
+
+Contestants were meant to predict the output of the farm, input the values into the data frame, and upload a CSV file to the contest website, which would then calculate the percentage error without revealing any data to the contestants. I contacted the BBDC staff after the conclusion of the contest to acquire the validation set, such that I could continue my analysis. Absolutely no models in this analysis were in any way trained on the validation set. This set is used exclusively to create predictions, and to calculate the error percentages of the models within the scope of this file, rather than through the contest website. The formulas used to calculate the error are as were given on the contest website.
+
+### Libraries
+```{r Libs}
+library(foreign)
+library(MASS)
+library(car)
+library(corrplot)
+library(rpart) #for trees
+library(ipred) #for bagging
+library(randomForest) #for random forest
+library(readr) #read in data
+library(gbm) #for gradient boosting
+library(rms)
+library(gam)
+library(ISLR)
+library(caTools)
+library(circular)
+library(openair)
+```
+
+```{r SetSeed}
+set.seed(101)
+```
+
+### Methods
+```{r Methods}
+##########Methods##############
+# some functions which are handy for plotting heatmaps of correlation matrices
+#
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+reorder_cormat <- function(cormat){
+  # Use correlation between variables as distance
+  dd <- as.dist((1-cormat)/2)
+  hc <- hclust(dd)
+  cormat <-cormat[hc$order, hc$order]
+}
+####
+```
+
+### Data Import and Preprocessing
+
+```{r Data, results = 'hide'}
+#Training Data
+train <- read_csv("Data/train.csv")
+View(train)
+summary(train)
+sum(is.na(train)) #No missings
+
+#Reviewing the date variable
+class(train$Datum)
+#Altering the location, so info is saved in English
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+#converting to date format
+train$Datum <- as.Date(train$Datum, format = c("%Y-%m-%d"))
+
+#Saving a copy of the training set without date
+Train.nodate <- train[,-1]
+
+#Validation Data
+eval <- read_csv("Data/eval.csv")
+View(eval)
+summary(eval)
+sum(is.na(eval)) #no missings
+
+#Converting the validation set to a dataframe
+class(eval)
+eval <- as.data.frame(eval)
+
+#converting date variable to type date
+class(eval$Datum)
+eval$Datum <- as.Date(eval$Datum, format = c("%Y-%m-%d"))
+```
+
+The output of the turbines is capped at 122400, so the output should not exceed this value. Below I review the two data frames to make sure there are no max value anomolies.
+
+```{r MaxOut}
+max(train$Output)
+max(eval$Output)
+```
+
+Since neither data frame has output values which exceed the maxium, I don't need to cap any values.
+
+### Reviewing the Variable Distributions
+```{r Var_Dists_train}
+#Distribution of Numeric Training Variables
+
+##Output - Training
+par(mfrow = c(1, 2))
+hist(train$Output, main = "Distribution of the Wind farm Output - Training")
+boxplot(train$Output, main = "Boxplot of Wind Farm Output - Training")
+```
+
+The output for the training set is notably left-skewed, but there are also a rather larger number of high output observations, which are very visible in the box plot.
+
+```{r Var_Dists_train_2}
+##Wind Strength - Training
+layout(matrix(c(1,1,2,3), 2, 2, byrow = TRUE))
+hist(train$Windgeschwindigkeit48M, main = "Wind Speed at 48 Meters - Training", sub = "Mean wind speed at 5.6 meters per second")
+hist(train$Windgeschwindigkeit100M, main = "Wind Speed at 100 Meters - Training", sub = "Mean wind speed at 6.8 meteres per second")
+hist(train$Windgeschwindigkeit152M, main = "Wind Speed at 152 Meters - Training", sub = "Mean wind speed at 7.6 meters per second")
+```
+
+The wind speeds are all slightly left-skewed. The average wind speed increases by approximately one meter per second from one hieght level to the next.
+
+```{r Var_Dists_train_3}
+##Wind speed/direction frequency - training
+###At 48M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_48 <- data.frame(train$Windgeschwindigkeit48M, circular(train$Windrichtung48M, units = "degrees"), train$Datum)
+names(df_48) <- c("ws", "wd", "date")
+####frequency plot
+polarFreq(df_48, main = "Wind Speed/Direction Frequencies at 48 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+###At 100M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_100 <- data.frame(train$Windgeschwindigkeit100M, circular(train$Windrichtung100M, units = "degrees"), train$Datum)
+names(df_100) <- c("ws", "wd", "date")
+####frequency plot
+polarFreq(df_100, main = "Wind Speed/Direction Frequencies at 100 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+###At 152M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_152 <- data.frame(train$Windgeschwindigkeit152M, circular(train$Windrichtung152M, units = "degrees"), train$Datum)
+names(df_152) <- c("ws", "wd", "date")
+####frequency plot
+polarFreq(df_152, main = "Wind Speed/Direction Frequencies at 152 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+```
+
+The above three plots show, in order of increase height measurement level, the frequency of speed and directional wind measurments. For all three height levels, the majority of winds were blowing in a south-westernly direction at a speed between 5 and 10 meters per second. 
+
+
+```{r Save_plots1, results='hide', include = FALSE}
+#saving training polarFreq plots
+png(filename = "Images/polarFreq_48_train.png")
+polarFreq(df_48, main = "Wind Speed/Direction Frequencies at 48 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+
+png(filename = "Images/polarFreq_100_train.png")
+polarFreq(df_100, main = "Wind Speed/Direction Frequencies at 100 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+
+png(filename = "Images/polarFreq_152_train.png")
+polarFreq(df_152, main = "Wind Speed/Direction Frequencies at 152 Meters - Training", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+```
+
+```{r Var_dists_Eval}
+#Distribution of Numeric Validation Variables
+
+##Output - Validation
+par(mfrow = c(1, 2))
+#title("Distribution of the Wind farm Output - Validation")
+hist(eval$Output)
+boxplot(eval$Output)
+```
+
+Again the distribution of the output is notably left-skewed.
+
+```{r Var_dists_eval_2}
+##Wind Speed - Validation
+layout(matrix(c(1,1,2,3), 2, 2, byrow = TRUE))
+hist(eval$Windgeschwindigkeit48M, main = "Wind Speed at 48 Meters - Validation")
+hist(eval$Windgeschwindigkeit100M, main = "Wind Speed at 100 Meters - Validation")
+hist(eval$Windgeschwindigkeit152M, main = "Wind Speed at 152 Meters - Validation")
+```
+
+Unlike the training data, which showed relatively normal distributionsfor the wind speeds, these distributoins are slightly less so. Specifically, the speeds measured at the 152 metter height level appear to be bimodal, with local maxima at approximately 7 m/s and 11 m/s.
+
+```{r Var_dists_eval_3}
+##Wind speed/direction frequency - Validation
+
+###At 48M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_48 <- data.frame(eval$Windgeschwindigkeit48M, circular(eval$Windrichtung48M, units = "degrees"), eval$Datum)
+names(df_48) <- c("ws", "wd", "date")
+
+####frequency plot
+polarFreq(df_48, main = "Wind Speed/Direction Frequencies at 48 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+###At 100M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_100 <- data.frame(eval$Windgeschwindigkeit100M, circular(eval$Windrichtung100M, units = "degrees"), eval$Datum)
+names(df_100) <- c("ws", "wd", "date")
+####frequency plot
+polarFreq(df_100, main = "Wind Speed/Direction Frequencies at 100 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+###At 152M
+####Creating dataframe of wind speed, wind direction, and date (converting wind direction to circular object with degree units)
+df_152 <- data.frame(train$Windgeschwindigkeit152M, circular(train$Windrichtung152M, units = "degrees"), train$Datum)
+names(df_152) <- c("ws", "wd", "date")
+####frequency plot
+polarFreq(df_152, main = "Wind Speed/Direction Frequencies at 152 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+
+```
+
+As in the training set, the majority of the winds seem to be blowing in a south-westernly direction, although these appear to be more west leaning than the training data. Additionally, there is a clear increase in the amount of north-easternly winds at the 152 meter level for the validation data.
+
+```{r Save_plot_2, include = FALSE, results = 'hide'}
+#saving validation plots
+png(filename = "Images/polarFreq_48_val.png")
+polarFreq(df_48, main = "Wind Speed/Direction Frequencies at 48 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+
+png(filename = "Images/polarFreq_100_val.png")
+polarFreq(df_100, main = "Wind Speed/Direction Frequencies at 100 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+
+png(filename = "Images/polarFreq_152_val.png")
+polarFreq(df_152, main = "Wind Speed/Direction Frequencies at 152 Meters - Validation", xlab = "Data reflects wind speed (m / s) & wind direction measurements \n taken between January, 2016 and June, 2017.", trans = FALSE)
+dev.off()
+```
+
+
+### Data Manipulation, Feature Creation, and Spliting the Training Data
+
+```{r Features}
+split <- sample.split(train$Output,
+                      SplitRatio = .70)
+train1 <- subset(train, split == TRUE)
+test <- subset(train, split == FALSE)
+
+#Adding Variables for Analysis
+#Adding month variable
+train$month <- months(train$Datum)
+train$season <- 0
+train$season[train$month == "May"] = 1
+train$season[train$month == "June"] = 1
+train$season[train$month == "July"] = 1
+train$season[train$month == "August"] = 1
+train$season[train$month == "September"] = 1
+train$season[train$month == "October"] = 1
+
+train$month[train$month == "January"] = 1
+train$month[train$month == "February"] = 2
+train$month[train$month == "March"] = 3
+train$month[train$month == "April"] = 4
+train$month[train$month == "May"] = 5
+train$month[train$month == "June"] = 6
+train$month[train$month == "July"] = 7
+train$month[train$month == "August"] = 8
+train$month[train$month == "September"] = 9
+train$month[train$month == "October"] = 10
+train$month[train$month == "November"] = 11
+train$month[train$month == "December"] = 12
+train$month <- as.numeric(train$month)
+
+eval$month <- months(eval[,1])
+eval$season <- 0
+eval$season[eval$month == "May"] = 1
+eval$season[eval$month == "June"] = 1
+eval$season[eval$month == "July"] = 1
+eval$season[eval$month == "August"] = 1
+eval$season[eval$month == "September"] = 1
+eval$season[eval$month == "October"] = 1
+
+eval$month[eval$month == "January"] = 1
+eval$month[eval$month == "February"] = 2
+eval$month[eval$month == "March"] = 3
+eval$month[eval$month == "April"] = 4
+eval$month[eval$month == "May"] = 5
+eval$month[eval$month == "June"] = 6
+eval$month[eval$month == "July"] = 7
+eval$month[eval$month == "August"] = 8
+eval$month[eval$month == "September"] = 9
+eval$month[eval$month == "October"] = 10
+eval$month[eval$month == "November"] = 11
+eval$month[eval$month == "December"] = 12
+eval$month <- as.numeric(eval$month)
+
+#Descriptives for the wind direction and speed
+train$winddirectionmean <- ((train$Windrichtung48M+train$Windrichtung100M+train$Windrichtung152M)/3)
+train$winddirectionvar <- (((train$Windrichtung48M-train$winddirectionmean)^2+(train$Windrichtung100M-train$winddirectionmean)^2+(train$Windrichtung152M-train$winddirectionmean)^2)/3)
+train$windspeedmean <- ((train$Windgeschwindigkeit48M+train$Windgeschwindigkeit100M+train$Windgeschwindigkeit152M)/3)
+train$windspeedvar <- (((train$Windgeschwindigkeit48M-train$windspeedmean)^2+(train$Windgeschwindigkeit100M-train$windspeedmean)^2+(train$Windgeschwindigkeit152M-train$windspeedmean)^2)/3)
+
+eval$winddirectionmean <- ((eval$Windrichtung48M+eval$Windrichtung100M+eval$Windrichtung152M)/3)
+eval$winddirectionvar <- (((eval$Windrichtung48M-eval$winddirectionmean)^2+(eval$Windrichtung100M-eval$winddirectionmean)^2+(eval$Windrichtung152M-eval$winddirectionmean)^2)/3)
+eval$windspeedmean <- ((eval$Windgeschwindigkeit48M+eval$Windgeschwindigkeit100M+eval$Windgeschwindigkeit152M)/3)
+eval$windspeedvar <- (((eval$Windgeschwindigkeit48M-eval$windspeedmean)^2+(eval$Windgeschwindigkeit100M-eval$windspeedmean)^2+(eval$Windgeschwindigkeit152M-eval$windspeedmean)^2)/3)
+
+#weighted average direction
+train$winddirectionweightedmean <- (((train$Windrichtung48M*train$Windgeschwindigkeit48M)+(train$Windrichtung100M*train$Windgeschwindigkeit100M)+(train$Windrichtung152M*train$Windgeschwindigkeit152M))/(train$Windgeschwindigkeit48M+train$Windgeschwindigkeit100M+train$Windgeschwindigkeit152M))
+
+eval$winddirectionweightedmean <- (((eval$Windrichtung48M*eval$Windgeschwindigkeit48M)+(eval$Windrichtung100M*eval$Windgeschwindigkeit100M)+(eval$Windrichtung152M*eval$Windgeschwindigkeit152M))/(eval$Windgeschwindigkeit48M+eval$Windgeschwindigkeit100M+eval$Windgeschwindigkeit152M))
+
+eval <- as.data.frame(eval)
+train <- as.data.frame(train)
+```
+
+## Modeling the Data to Predict Output
+
+### Linear Model
+
+```{r LM}
+#creating basic full LM and best fit model
+full <- lm(Output~., train)
+best <- stepAIC(full, 
+                direction = "backward", 
+                trace = 0)
+summary(best)
+anova(best)
+
+#glm
+glm1 <- glm(Output~., family=gaussian, data=train)
+stepglm <- step(glm1, trace = 0)
+summary(stepglm)
+```
+
+#### Predictions
+```{r Preds_LM}
+#lm
+print("Linear Model")
+predict.best <- round(predict(best, eval), digits=0)
+(sum((eval$Output-predict.best)^2)/nrow(eval))^(1/2)
+error_lm <- (sum(abs(predict.best-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_lm
+
+#glm
+print("General Linear Model")
+predict.glm <- round(predict(stepglm, newdata=eval), digits=0)
+(sum((eval$Output-predict.glm)^2)/nrow(eval))^(1/2)
+error_glm <- (sum(abs(predict.glm-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_glm
+```
+
+#### Creating Data Frame for results
+```{r Results}
+results <- 
+  data.frame(
+    "Model" = "Best EQ Linear Model", 
+    "Error Percentage" = error_lm,
+    stringsAsFactors = FALSE)
+
+results <- rbind(results, 
+                 list("Best Linear Model",
+                      error_lm))
+
+results <- rbind(results, 
+                 list("GLM Model",
+                      error_glm))
+
+```
+
+### Tree Models
+
+```{r Tree}
+tree <- rpart(full, data=train)
+plot(tree)
+
+tree.1 <- rpart(best, data=train)
+tree.1
+plot(tree.1, uniform=TRUE, 
+     main="Classification Tree for Output")
+text(tree.1, use.n=TRUE, all=TRUE, cex=.8)
+```
+
+#### Predictions
+```{r Preds_Tree}
+#Tree with full formula
+print("Full Model Tree")
+predict.tree <- round(predict(tree, newdata=eval), digits=0)
+(sum((eval$Output-predict.tree)^2)/nrow(eval))^(1/2)
+error_tree <- (sum(abs(predict.tree-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_tree
+
+#Tree with Best formula
+print("Best Formula Tree")
+predict.tree1 <- round(predict(tree.1, newdata=eval), digits=0)
+(sum((eval$Output-predict.tree1)^2)/nrow(eval))^(1/2)
+error_tree.1 <- (sum(abs(predict.tree1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_tree.1
+
+results <- rbind(results, list("Full Formula Tree", error_tree), list("Best Formula Tree", error_tree.1))
+```
+
+### Random Forest Models
+
+```{r RF}
+#Full formula model
+rforest <- randomForest(Output~., data=train)
+plot(rforest)
+rforest$rsq
+importance(rforest, type=1)
+importance(rforest, type=2)
+
+#Best formula Model
+rforest.1 <- randomForest(Output~ Datum+Windgeschwindigkeit48M+Windgeschwindigkeit100M+Windgeschwindigkeit152M+Windrichtung48M+Windrichtung100M+Windrichtung152M
+                          +Windgeschwindigkeit100MP40+Windgeschwindigkeit100MP50+Windgeschwindigkeit100MP70+Windgeschwindigkeit100MP90+Verfügbare_Kapazität, data=train)
+plot(rforest.1)
+rforest.1$rsq
+```
+
+#### Predictions
+```{r Preds_rf}
+#Full model forest
+print("Full Random Forest Model")
+predict.rforest <- round(predict(rforest, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest)^2)/nrow(eval))^(1/2)
+error_rf <- (sum(abs(predict.rforest-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_rf
+
+#best model
+print("Best Model Formula")
+predict.rforest1 <- round(predict(rforest.1, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest1)^2)/nrow(eval))^(1/2)
+error_rfbest <- (sum(abs(predict.rforest1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_rfbest
+
+results <- 
+  rbind(results, 
+        list("Full Formula Random Forest",
+             error_rf),
+        list("Best Formula Random Forest",
+             error_rfbest))
+```
+
+#### Tuneing the Random Forest Models
+```{r RF_tune}
+tuned <- tuneRF(train[,-19], train[,19], stepFactor = 2, improve=0.05, plot=TRUE)
+```
+
+It appears that the best mtry value, the number of variable tried at each split of the tree, is 8 variables.
+
+#### New Tuned Model
+```{r Tuned_RF}
+rforest.2 <- 
+  randomForest(Output~ Datum + 
+                 Windgeschwindigkeit48M +
+                 Windgeschwindigkeit100M +
+                 Windgeschwindigkeit152M + 
+                 Windrichtung100M +
+                 Windrichtung152M +
+                 Windgeschwindigkeit100MP10+
+                 Windgeschwindigkeit100MP30+
+                 Windgeschwindigkeit100MP40+
+                 Windgeschwindigkeit100MP50+
+                 Windgeschwindigkeit100MP70+
+                 Windgeschwindigkeit100MP90+
+                 Verfügbare_Kapazität +
+                 month + 
+                 winddirectionvar + 
+                 windspeedvar +
+                 winddirectionweightedmean,
+               mtry = 8,
+               data=train)
+plot(rforest.2)
+```
+
+#### Predictions
+```{r Preds_Trf}
+predict.rforest2 <- round(predict(rforest.2, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest2)^2)/nrow(eval))^(1/2)
+error_trf <- (sum(abs(predict.rforest2-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_trf
+
+results <- 
+  rbind(results, 
+        list("Tuned Random Forest", 
+             error_trf))
+```
+
+#### PLots
+```{r Plots}
+plot(rforest.2, col = "red", main = "Random Forest Final Model Comparison")
+plot(rforest.1, col= "blue", add= TRUE)
+plot(rforest, col = "green", add= TRUE)
+```
+
+
+
+### Bagged Model
+```{r Bag}
+#full formula model
+bag <- bagging(train$Output~., train)
+
+#best formula model
+bag.1 <- 
+  bagging(Output~ Datum +
+            Windgeschwindigkeit48M +
+            Windgeschwindigkeit100M +
+            Windgeschwindigkeit152M +
+            Windrichtung100M +
+            Windrichtung152M +
+            Windgeschwindigkeit100MP10 +
+            Windgeschwindigkeit100MP30 +
+            Windgeschwindigkeit100MP40 +
+            Windgeschwindigkeit100MP50 +
+            Windgeschwindigkeit100MP70 +
+            Windgeschwindigkeit100MP90 +
+            Verfügbare_Kapazität + 
+            month +
+            winddirectionvar + 
+            windspeedvar +
+            winddirectionweightedmean,
+          data=train)
+```
+
+#### Predictions
+```{r Preds_bag}
+#full model preds
+print("Full Model")
+predict.bag <- round(predict(bag, newdata=eval),digits=0)
+(sum((eval$Output-predict.bag)^2)/nrow(eval))^(1/2)
+error_bag <- (sum(abs(predict.bag-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_bag 
+
+#best model preds
+print("Best Model")
+predict.bag1 <- round(predict(bag.1, newdata = eval), digits=0)
+(sum((eval$Output-predict.bag1)^2)/nrow(eval))^(1/2)
+error_bagbest <- (sum(abs(predict.bag1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_bagbest
+
+results <- 
+  rbind(results, 
+        list("Full Formula Bagging Model",
+             error_bag),
+        list("Best Formula Bagging Model",
+             error_bagbest))
+```
+
+### Gradient Boosting Model
+```{r GradBoost}
+#full model
+boost <- 
+  gbm(Output~.-Datum,
+      distribution = "laplace", 
+      data=train, n.trees = 1000, 
+      shrinkage = 0.03, 
+      interaction.depth = 6)
+summary(boost)
+
+#fewer trees
+boost.fewtrees <- gbm(Output~.-Datum,
+                      data=train, 
+                      n.trees = 700,
+                      shrinkage = 0.01,
+                      interaction.depth = 8)
+
+
+#600 trees
+boost.600 <- gbm(Output~.-Datum, 
+                 data=train, 
+                 n.trees = 600, 
+                 shrinkage = 0.01,
+                 interaction.depth = 8)
+
+#no date
+boost.1 <- 
+  gbm(Output ~ Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung48M +
+        Windrichtung100M +
+        Windrichtung152M +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität,
+      data = train,
+      distribution = "laplace",
+      n.trees = 1000,
+      shrinkage = 0.03,
+      interaction.depth = 7)
+
+#new var boost
+boost.12 <- 
+  gbm(Output~Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung100M + 
+        Windrichtung152M +
+        Windgeschwindigkeit100MP10 +
+        Windgeschwindigkeit100MP30 +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität + 
+        month +
+        winddirectionvar + 
+        windspeedvar +
+        winddirectionweightedmean,
+      data=train, 
+      distribution = "laplace", 
+      n.trees = 700, 
+      shrinkage = 0.03, 
+      interaction.depth = 6)
+
+```
+
+#### Predictions
+```{r Preds_GDB}
+#full model preds
+print("Full Model")
+predict.boost <- round(predict(boost, newdata=eval, n.trees = 1000), digits=0)
+(sum((eval$Output-predict.boost)^2)/nrow(eval))^(1/2)
+error_grad <- (sum(abs(predict.boost-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_grad
+
+#few trees
+print("Fewer Trees")
+predict.boostft <- round(predict(boost.fewtrees, newdata=eval, n.trees = 700), digits=0)
+(sum((eval$Output-predict.boostft)^2)/nrow(eval))^(1/2)
+error_gradFT <- (sum(abs(predict.boostft-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gradFT
+
+#600 Trees
+print("600 Trees")
+predict.boost600 <- round(predict(boost.600, newdata=eval, n.trees = 600), digits=0)
+(sum((eval$Output-predict.boost600)^2)/nrow(eval))^(1/2)
+error_g600 <- (sum(abs(predict.boost600-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_g600
+
+#no date
+print("No Date Model")
+predict.boost1 <- round(predict(boost.1, newdata=eval, n.trees = 1000), digits=0)
+(sum((eval$Output-predict.boost1)^2)/nrow(eval))^(1/2)
+error_gnd <- (sum(abs(predict.boost1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gnd
+
+#new var boost
+print("New Variable Model")
+predict.boost12 <- round(predict(boost.12, newdata=eval, n.trees = 700), digits=0)
+error_gdbNV <- (sum(abs(predict.boost12-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gdbNV
+
+results <- 
+  rbind(results,
+        list("Full Formula Gradient Boosting Model",
+             error_grad),
+        list("Fewer Trees GBM",
+             error_gradFT),
+        list("600 Trees GBM",
+             error_g600),
+        list("GBM Without Date", 
+             error_gnd),
+        list("New Variable GBM",
+             error_gdbNV))
+```
+
+The gradient boosting models have preformed the best overall at predicting the validation set. As such, I'll be creating notably more of these models, for tuning and further testing.
+
+```{r GBM_FurtherTesting}
+#decreasing shrinkage rate
+boost.2 <- 
+  gbm(Output~Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung48M +
+        Windrichtung100M +
+        Windrichtung152M +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität, 
+      data=train, 
+      n.trees = 600, 
+      shrinkage = 0.02, 
+      interaction.depth = 8)
+
+boost.3 <- 
+  gbm(Output~ Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung48M +
+        Windrichtung100M +
+        Windrichtung152M +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität,
+      data=train, 
+      n.trees = 600, 
+      shrinkage = 0.03, 
+      interaction.depth = 8)
+
+class(train$month)
+train$month <- as.factor(train$month)
+boost.fac <- 
+  gbm(Output~ month +
+        Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung48M +
+        Windrichtung100M +
+        Windrichtung152M +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität, 
+      distribution = "laplace",
+      data=train, 
+      n.trees = 600, 
+      shrinkage = 0.03, 
+      interaction.depth = 7)
+train$month <- as.numeric(train$month)
+
+
+
+```
+
+
+#### Predictions
+```{r Preds_GBM_FT}
+predict.boost2 <- round(predict(boost.2, newdata=eval, n.trees = 600), digits=0)
+error_gbm.2 <- (sum(abs(predict.boost2-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gbm.2
+
+predict.boost3 <- round(predict(boost.3, newdata=eval, n.trees = 600), digits=0)
+error_gbm.3 <- (sum(abs(predict.boost3-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gbm.3
+
+eval$month <- as.factor(eval$month)
+predict.boost.fac <- round(predict(boost.fac, newdata=eval, n.trees = 600), digits=0)
+error_gbm.fac <- (sum(abs(predict.boost.fac-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gbm.fac
+eval$month <- as.numeric(eval$month)
+
+results <- 
+  rbind(results,
+        list("Decrease Shrinkage Boost",
+             error_gbm.2),
+        list("Gaussian GBM", error_gbm.3),
+        list("Factor Month GBM",
+             error_gbm.fac))
+```
+
+
+### General Additive Model (GAM)
+```{r GAM}
+#model 1
+gam_form <- as.formula(paste("Output~ month+s(Windgeschwindigkeit48M)+s(Windgeschwindigkeit100M)+s(Windgeschwindigkeit152M)+s(Windrichtung48M)+s(Windrichtung100M)+s(Windrichtung152M)+s(Windgeschwindigkeit100MP40)+s(Windgeschwindigkeit100MP50)+s(Windgeschwindigkeit100MP70)+s(Windgeschwindigkeit100MP90)+s(Verfügbare_Kapazität)"))
+
+gam1 <- gam(formula = gam_form,
+            family=gaussian, data=train)
+
+#model 2
+gam_formsix <- as.formula(paste("Output~ s(Windgeschwindigkeit48M)+s(Windgeschwindigkeit100M)+s(Windgeschwindigkeit152M)+s(Windrichtung48M)+s(Windrichtung100M)+s(Windrichtung152M)+s(Windgeschwindigkeit100MP10)+s(Windgeschwindigkeit100MP20)+s(Windgeschwindigkeit100MP50)+s(Windgeschwindigkeit100MP60)+s(Windgeschwindigkeit100MP80)+s(Verfügbare_Kapazität)+ s(winddirectionweightedmean)+s(windspeedmean)"))
+gam2 <- gam(formula = gam_formsix,
+             family=gaussian, data=train)
+
+```
+
+#### Predictions
+```{r Preds_GAM}
+#Model 1
+print("Model 1")
+predict.gam <- round(predict(gam1, newdata=eval), digits=0)
+error_gam1 <- (sum(abs(predict.gam-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gam1
+
+#Model 2
+print("Model 2")
+predict.gam2 <- round(predict(gam2, newdata=eval), digits=0)
+error_gam2 <- (sum(abs(predict.gam2-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gam2
+
+results <- 
+  rbind(results, 
+        list("GAM Model 1", error_gam1),
+        list("GAM Model 2", error_gam2))
+```
+
+
+## Matching The Dates
+The data presented as the training data covers significant period of time, but the "challenge" was to predict the output for a much shorter range of time in the following year. It may be that, due to some seasonality (which would make sense as this is highly dependant on the weather) may be causing us to over or underestimate in our predictions. As such, I am going to restrict the training data set to dates which match those in the validation set. 
+
+```{r DateMatching}
+summary(train$Datum) #2016 Jan - 2017 June
+summary(eval$Datum) #2017 July - 2017 Dec
+
+train.dates <- subset.data.frame(train, Datum >= "2016-07-01" & Datum <= "2016-12-31")
+```
+
+### Gradient Boosting on Matching Date Data
+
+I'll start by using the best preforming model from the full training data set.
+
+```{r GBM_Dates}
+boost.Dates.1 <- 
+  gbm(Output ~ Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung48M +
+        Windrichtung100M +
+        Windrichtung152M +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität,
+      data = train.dates,
+      distribution = "laplace",
+      n.trees = 1000,
+      shrinkage = 0.03,
+      interaction.depth = 7)
+
+boost.Dates.2 <- 
+  gbm(Output~Windgeschwindigkeit48M +
+        Windgeschwindigkeit100M +
+        Windgeschwindigkeit152M +
+        Windrichtung100M + 
+        Windrichtung152M +
+        Windgeschwindigkeit100MP10 +
+        Windgeschwindigkeit100MP30 +
+        Windgeschwindigkeit100MP40 +
+        Windgeschwindigkeit100MP50 +
+        Windgeschwindigkeit100MP70 +
+        Windgeschwindigkeit100MP90 +
+        Verfügbare_Kapazität + 
+        month +
+        winddirectionvar + 
+        windspeedvar +
+        winddirectionweightedmean,
+      data=train.dates, 
+      distribution = "laplace", 
+      n.trees = 700, 
+      shrinkage = 0.03, 
+      interaction.depth = 6)
+
+```
+
+```{r Preds_GBM_Dates}
+print("No Date Model")
+predict.boost.Dates.1 <- round(predict(boost.Dates.1, newdata=eval, n.trees = 1000), digits=0)
+(sum((eval$Output-predict.boost.Dates.1)^2)/nrow(eval))^(1/2)
+error_gbm.d.1 <- (sum(abs(predict.boost.Dates.1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gbm.d.1
+
+predict.boost.Dates.2 <- round(predict(boost.Dates.2, newdata=eval, n.trees = 700), digits=0)
+(sum((eval$Output-predict.boost.Dates.2)^2)/nrow(eval))^(1/2)
+error_gbm.d.2 <- (sum(abs(predict.boost.Dates.2-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gbm.d.2
+
+results <- 
+  rbind(results,
+        list("GBM No Date - Matching Date Data", error_gbm.d.1),
+        list("GBM New Var - Matching Dates", error_gbm.d.2))
+```
+
+
+### GAM Dates Models
+```{r GAM_2}
+#model 1
+gam1.dates <- gam(formula = gam_form,
+            family=gaussian,
+            data=train.dates)
+
+#model 2
+gam2.dates <- gam(formula = gam_formsix,
+             family=gaussian,
+             data=train.dates)
+
+```
+
+#### Predictions
+```{r Preds_GAM_2}
+#Model 1
+print("Model 1")
+predict.gam1.dates <-
+  round(predict(gam1.dates, newdata=eval),
+        digits=0)
+error_gam1.dates <- (sum(abs(predict.gam1.dates-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gam1.dates
+
+#Model 2
+print("Model 2")
+predict.gam2.dates <- 
+  round(predict(gam2.dates, newdata=eval),
+        digits=0)
+error_gam2.dates <- (sum(abs(predict.gam2.dates-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_gam2.dates
+
+results <- 
+  rbind(results,
+        list("GAM 1 - Matching Dates",
+             error_gam1.dates),
+        list("GAM 2 - Matching Dates",
+             error_gam2.dates))
+```
+
+
+### RF Dates Models
+
+```{r rF_dates}
+rforest.dates <- randomForest(Output~., data=train.dates)
+```
+
+#### Predictions
+```{r Preds_RFDates}
+print("RF Dates")
+predict.rf.dates <- 
+  round(predict(rforest.dates, newdata=eval),
+        digits=0)
+error_rf.dates <- (sum(abs(predict.rf.dates-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_rf.dates
+
+
+results <- 
+  rbind(results,
+        list("RF Dates",
+             error_rf.dates))
+```
+
+
+
+## Saving Results Data
+```{r Save_Results}
+save(results, file = "Data_out/results.Rda")
+```

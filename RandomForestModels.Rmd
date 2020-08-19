@@ -1,0 +1,249 @@
+---
+title: "Random Forest Models"
+author: "AE"
+date: "11/17/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Bremen Big Data Challenge
+## Random Forest Models
+This file contains only the random forest models shown in both the Main PresentationCode file and the Matching Dates file. 
+
+### Recap
+The challenge given to contestants was to take wind farm data collected from January, 2016 to June 2017, and the predict the wind farm's output in July - December of 2017.
+
+The data includes:
+* Wind speed and direction at different elevations (All measurements were collected at various heights. All measurements were only taken at certain intervals, and as such certain observations have been linearly interpolated.) 
+* A boolean variable which reflects whether the given observation was interpolated or not 
+* Capacity of the farm at a given time (This capacity variable is very nearly constant, and most likely only shows variation due to maitainence or downages at the farm.)
+* Output of the farm (The original "challenge" data set presented to the contestants did not have any values in the output variable. Outside of the voiding of the output column, the challenge set and validation set are identical.)
+
+### Libraries
+```{r Libs}
+library(foreign)
+library(MASS)
+library(car)
+library(corrplot)
+library(rpart) #for trees
+library(ipred) #for bagging
+library(randomForest) #for random forest
+library(readr) #read in data
+library(gbm) #for gradient boosting
+library(rms)
+library(gam)
+library(ISLR)
+library(caTools)
+library(circular)
+library(openair)
+```
+
+### Data Import and Preprocessing
+
+```{r Data, results = 'hide'}
+#Training Data
+train <- read_csv("Data/train.csv")
+View(train)
+summary(train)
+sum(is.na(train)) #No missings
+
+#Reviewing the date variable
+class(train$Datum)
+#Altering the location, so info is saved in English
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+#converting to date format
+train$Datum <- as.Date(train$Datum, format = c("%Y-%m-%d"))
+
+#Saving a copy of the training set without date
+Train.nodate <- train[,-1]
+
+#Validation Data
+eval <- read_csv("Data/eval.csv")
+View(eval)
+summary(eval)
+sum(is.na(eval)) #no missings
+
+#Converting the validation set to a dataframe
+class(eval)
+eval <- as.data.frame(eval)
+
+#converting date variable to type date
+class(eval$Datum)
+eval$Datum <- as.Date(eval$Datum, format = c("%Y-%m-%d"))
+
+#Results Data
+load("Data_out/results.Rda")
+```
+
+### Data Manipulation, Feature Creation, and Spliting the Training Data
+
+```{r Features}
+#Adding Variables for Analysis
+#Adding month variable
+train$month <- months(train$Datum)
+train$season <- 0
+train$season[train$month == "May"] = 1
+train$season[train$month == "June"] = 1
+train$season[train$month == "July"] = 1
+train$season[train$month == "August"] = 1
+train$season[train$month == "September"] = 1
+train$season[train$month == "October"] = 1
+
+train$month[train$month == "January"] = 1
+train$month[train$month == "February"] = 2
+train$month[train$month == "March"] = 3
+train$month[train$month == "April"] = 4
+train$month[train$month == "May"] = 5
+train$month[train$month == "June"] = 6
+train$month[train$month == "July"] = 7
+train$month[train$month == "August"] = 8
+train$month[train$month == "September"] = 9
+train$month[train$month == "October"] = 10
+train$month[train$month == "November"] = 11
+train$month[train$month == "December"] = 12
+train$month <- as.numeric(train$month)
+
+eval$month <- months(eval[,1])
+eval$season <- 0
+eval$season[eval$month == "May"] = 1
+eval$season[eval$month == "June"] = 1
+eval$season[eval$month == "July"] = 1
+eval$season[eval$month == "August"] = 1
+eval$season[eval$month == "September"] = 1
+eval$season[eval$month == "October"] = 1
+
+eval$month[eval$month == "January"] = 1
+eval$month[eval$month == "February"] = 2
+eval$month[eval$month == "March"] = 3
+eval$month[eval$month == "April"] = 4
+eval$month[eval$month == "May"] = 5
+eval$month[eval$month == "June"] = 6
+eval$month[eval$month == "July"] = 7
+eval$month[eval$month == "August"] = 8
+eval$month[eval$month == "September"] = 9
+eval$month[eval$month == "October"] = 10
+eval$month[eval$month == "November"] = 11
+eval$month[eval$month == "December"] = 12
+eval$month <- as.numeric(eval$month)
+
+#Descriptives for the wind direction and speed
+train$winddirectionmean <- ((train$Windrichtung48M+train$Windrichtung100M+train$Windrichtung152M)/3)
+train$winddirectionvar <- (((train$Windrichtung48M-train$winddirectionmean)^2+(train$Windrichtung100M-train$winddirectionmean)^2+(train$Windrichtung152M-train$winddirectionmean)^2)/3)
+train$windspeedmean <- ((train$Windgeschwindigkeit48M+train$Windgeschwindigkeit100M+train$Windgeschwindigkeit152M)/3)
+train$windspeedvar <- (((train$Windgeschwindigkeit48M-train$windspeedmean)^2+(train$Windgeschwindigkeit100M-train$windspeedmean)^2+(train$Windgeschwindigkeit152M-train$windspeedmean)^2)/3)
+
+eval$winddirectionmean <- ((eval$Windrichtung48M+eval$Windrichtung100M+eval$Windrichtung152M)/3)
+eval$winddirectionvar <- (((eval$Windrichtung48M-eval$winddirectionmean)^2+(eval$Windrichtung100M-eval$winddirectionmean)^2+(eval$Windrichtung152M-eval$winddirectionmean)^2)/3)
+eval$windspeedmean <- ((eval$Windgeschwindigkeit48M+eval$Windgeschwindigkeit100M+eval$Windgeschwindigkeit152M)/3)
+eval$windspeedvar <- (((eval$Windgeschwindigkeit48M-eval$windspeedmean)^2+(eval$Windgeschwindigkeit100M-eval$windspeedmean)^2+(eval$Windgeschwindigkeit152M-eval$windspeedmean)^2)/3)
+
+#weighted average direction
+train$winddirectionweightedmean <- (((train$Windrichtung48M*train$Windgeschwindigkeit48M)+(train$Windrichtung100M*train$Windgeschwindigkeit100M)+(train$Windrichtung152M*train$Windgeschwindigkeit152M))/(train$Windgeschwindigkeit48M+train$Windgeschwindigkeit100M+train$Windgeschwindigkeit152M))
+
+eval$winddirectionweightedmean <- (((eval$Windrichtung48M*eval$Windgeschwindigkeit48M)+(eval$Windrichtung100M*eval$Windgeschwindigkeit100M)+(eval$Windrichtung152M*eval$Windgeschwindigkeit152M))/(eval$Windgeschwindigkeit48M+eval$Windgeschwindigkeit100M+eval$Windgeschwindigkeit152M))
+
+eval <- as.data.frame(eval)
+train <- as.data.frame(train)
+```
+
+### Random Forest Models
+
+```{r RF}
+#Full formula model
+rforest <- randomForest(Output~., data=train)
+plot(rforest)
+rforest$rsq
+importance(rforest, type=1)
+importance(rforest, type=2)
+
+#Best formula Model
+rforest.1 <- randomForest(Output~ Datum+Windgeschwindigkeit48M+Windgeschwindigkeit100M+Windgeschwindigkeit152M+Windrichtung48M+Windrichtung100M+Windrichtung152M
+                          +Windgeschwindigkeit100MP40+Windgeschwindigkeit100MP50+Windgeschwindigkeit100MP70+Windgeschwindigkeit100MP90+Verfügbare_Kapazität, data=train)
+plot(rforest.1)
+rforest.1$rsq
+```
+
+#### Predictions
+```{r Preds_rf}
+#Full model forest
+print("Full Random Forest Model")
+predict.rforest <- round(predict(rforest, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest)^2)/nrow(eval))^(1/2)
+error_rf <- (sum(abs(predict.rforest-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_rf
+
+#best model
+print("Best Model Formula")
+predict.rforest1 <- round(predict(rforest.1, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest1)^2)/nrow(eval))^(1/2)
+error_rfbest <- (sum(abs(predict.rforest1-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_rfbest
+
+results <- 
+  rbind(results, 
+        list("Full Formula Random Forest",
+             error_rf),
+        list("Best Formula Random Forest",
+             error_rfbest))
+```
+
+#### Tuneing the Random Forest Models
+```{r RF_tune}
+tuned <- tuneRF(train[,-19], train[,19], stepFactor = 2, improve=0.05, plot=TRUE)
+```
+
+It appears that the best mtry value, the number of variable tried at each split of the tree, is 8 variables.
+
+#### New Tuned Model
+```{r Tuned_RF}
+rforest.2 <- 
+  randomForest(Output~ Datum + 
+                 Windgeschwindigkeit48M +
+                 Windgeschwindigkeit100M +
+                 Windgeschwindigkeit152M + 
+                 Windrichtung100M +
+                 Windrichtung152M +
+                 Windgeschwindigkeit100MP10+
+                 Windgeschwindigkeit100MP30+
+                 Windgeschwindigkeit100MP40+
+                 Windgeschwindigkeit100MP50+
+                 Windgeschwindigkeit100MP70+
+                 Windgeschwindigkeit100MP90+
+                 Verfügbare_Kapazität +
+                 month + 
+                 winddirectionvar + 
+                 windspeedvar +
+                 winddirectionweightedmean,
+               mtry = 8,
+               data=train)
+plot(rforest.2)
+```
+
+#### Predictions
+```{r Preds_Trf}
+predict.rforest2 <- round(predict(rforest.2, newdata=eval), digits=0)
+(sum((eval$Output-predict.rforest2)^2)/nrow(eval))^(1/2)
+error_trf <- (sum(abs(predict.rforest2-eval$Output)))/sum(eval$Verfügbare_Kapazität)
+error_trf
+
+results <- 
+  rbind(results, 
+        list("Tuned Random Forest", 
+             error_trf))
+```
+
+#### PLots
+```{r Plots}
+plot(rforest.2, col = "red", main = "Random Forest Final Model Comparison")
+plot(rforest.1, col= "blue", add= TRUE)
+plot(rforest, col = "green", add= TRUE)
+```
+
+### Saving Results
+```{r Save_Results}
+save(results, "Data_out/results.Rda")
+
+```

@@ -1,0 +1,24 @@
+#read in data
+install.packages("readr")
+
+#Analysis tools
+install.packages("foreign")
+install.packages("MASS")
+install.packages("car")
+install.packages("corrplot")
+install.packages("caTools")
+
+#Visualizations
+install.packages("circular")
+install.packages("openair")
+
+#Modeling packages
+install.packages("rpart")
+install.packages("randomForest")
+install.packages("gbm")
+install.packages("gam")
+
+
+install.packages("ipred")
+install.packages("rms")
+install.packages("ISLR")

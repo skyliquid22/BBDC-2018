@@ -1,0 +1,25 @@
+#Don't want to include my old submission files
+#They aren't of interest to the analysis done here
+Submissions/
+
+#I used the following folder of code files in my initial work
+#But im not using them in any of the extended analysis
+#So I won't include them in the commits
+Old_Work/
+
+#Contest info I don't need/isn't relevant
+Contest_Info/
+
+#Misc Files
+.RData
+.Rhistory
+WorkSpaceWithOneRF.RData
+
+#Unwanted old visualizations/tableau books
+Tableau_No/
+
+#knit files
+PresentationCode_files/
+
+#Data - Too large for github
+Data/
